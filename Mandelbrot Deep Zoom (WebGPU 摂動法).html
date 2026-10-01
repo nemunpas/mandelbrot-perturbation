@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Mandelbrot Deep Zoom (WebGPU)</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;color:#e8f4ff;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace}
+canvas{position:fixed;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}
+#hud{position:fixed;left:0;top:0;padding:calc(10px + env(safe-area-inset-top,0px)) 12px 8px;white-space:pre;text-shadow:0 0 4px #000,0 0 2px #000;pointer-events:none}
+#ui{position:fixed;left:0;bottom:0;padding:8px 12px calc(8px + env(safe-area-inset-bottom,0px));display:flex;gap:6px;flex-wrap:wrap}
+select,button{background:#000a;color:#e8f4ff;border:1px solid #fff4;border-radius:6px;padding:4px 8px;font:inherit}
+#err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:24px;text-align:center;font-size:14px}
+</style></head><body>
+<canvas id="c"></canvas><div id="hud"></div>
+<div id="ui"><select id="bm"></select><select id="pal"><option>Deep Ocean</option><option>Fire</option><option>Nebula</option></select><button id="save">PNG保存</button></div>
+<div id="err"></div>
+<script>
+const WGSL=`
+struct U{res:vec2f,m:f32,e0:f32,mi:u32,rl:u32,pal:u32,p:u32};
+@group(0)@binding(0) var<uniform> u:U;
+@group(0)@binding(1) var<storage,read> zr:array<vec2f>;
+var<private> PAL=array<vec3f,12>(
+ vec3f(0,.02,.25),vec3f(0,.35,.8),vec3f(.1,.9,1),vec3f(1,1,1),
+ vec3f(0,0,0),vec3f(.7,.05,0),vec3f(1,.5,0),vec3f(1,.95,.3),
+ vec3f(.25,0,.45),vec3f(.1,.15,.85),vec3f(1,.3,.7),vec3f(1,1,1));
+fn cm(a:vec2f,b:vec2f)->vec2f{return vec2f(a.x*b.x-a.y*b.y,a.x*b.y+a.y*b.x);}
+@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{
+ let p=vec2f(f32((i<<1u)&2u),f32(i&2u));return vec4f(p*2.0-1.0,0.0,1.0);}
+@fragment fn fs(@builtin(position) fc:vec4f)->@location(0) vec4f{
+ let p=vec2f(fc.x-.5*u.res.x,.5*u.res.y-fc.y)/u.res.y;
+ let dc=p*u.m;            // true dc = dc * 2^e0
+ var d=dc;var E=u.e0;     // true delta = d * 2^E
+ var k=0u;var m2=0.0;var i=0u;var esc=false;
+ for(;i<u.mi;i=i+1u){
+  let dt=d*exp2(E);
+  let f=zr[k]+dt;
+  m2=dot(f,f);
+  if(m2>256.0){esc=true;break;}
+  var Z=zr[k];
+  // rebasing: delta got larger than full value, or reference orbit ended
+  if(m2<dot(dt,dt)||k+1u>=u.rl){d=f;E=0.0;k=0u;Z=vec2f(0.0);}
+  d=2.0*cm(Z,d)+exp2(E)*cm(d,d)+dc*exp2(u.e0-E);
+  k=k+1u;
+  if(max(abs(d.x),abs(d.y))>1e15){d=d*8.8817842e-16;E=E+50.0;}
+ }
+ if(!esc){return vec4f(0,0,0,1);}
+ let mu=max(f32(i)+1.0-log2(.5*log(m2)),0.0);
+ let t=log(mu+1.0)*.6;
+ let x=abs(fract(t)*2.0-1.0);let q=x*3.0;let j=min(u32(q),2u);
+ var fr=q-f32(j);fr=fr*fr*(3.0-2.0*fr);
+ let b=u.pal*4u+j;
+ var c=mix(PAL[b],PAL[b+1u],fr);
+ c=c+.4*c*c;                                  // pseudo bloom
+ let v=fc.xy/u.res-.5;c=c*(1.0-.5*dot(v,v));  // vignette
+ return vec4f(c,1);
+}`;
+const $=id=>document.getElementById(id),cv=$('c'),hud=$('hud');
+const PN=480,PB=BigInt(PN),ZMAX=360,MAXI=8000,L2_10=Math.log2(10);
+// fixed-point BigInt helpers (center kept with 480 fractional bits)
+const sh=(b,s)=>s>=0?b<<BigInt(s):b>>BigInt(-s);
+const fromS=(v,e)=>sh(BigInt(Math.round(v*2**30)),e+PN-30);
+const parse=s=>{const n=s[0]=='-';s=s.replace('-','');const[a,b='']=s.split('.');const v=BigInt(a+b)*(1n<<PB)/10n**BigInt(b.length);return n?-v:v};
+const dec=b=>{const n=b<0n;if(n)b=-b;const s=((b*10n**24n)>>PB).toString().padStart(25,'0');return(n?'-':'')+s.slice(0,-24)+'.'+s.slice(-24,-4)};
+// bookmarks: [name, x, y, log10(zoom)]  (Seahorse Valley is a known deep point; others are rough starting spots)
+const BM=[['ブックマーク…'],
+['Seahorse Valley','-0.743643887037158704752191506114774','0.131825904205311970493132056385139',12],
+['Elephant Valley','0.275','0.006',2.5],
+['Mini Mandelbrot','-1.75487766624669276','0',3],
+['Spiral','-0.77568377','0.13646737',4],
+['Triple Spiral','-0.088','0.654',2]];
+let cx=parse('-0.5'),cy=0n,zl=0,pal=0;
+BM.forEach((b,i)=>{const o=document.createElement('option');o.textContent=b[0];o.value=i;$('bm').append(o)});
+function view(){const span=3*2**-zl;let e0=Math.floor(Math.log2(span)),m=span/2**e0;if(m>=2){m/=2;e0++}return{m,e0}}
+// reference orbit in BigInt fixed point, converted to f32 for the GPU
+function orbit(maxI){
+ const Pc=Math.max(64,Math.ceil(zl)+64),s=BigInt(PN-Pc),cr=cx>>s,ci=cy>>s,pc=BigInt(Pc),inv=2**-Pc;
+ const a=new Float32Array(2*(maxI+1));let zr=0n,zi=0n,n=0;
+ for(;n<=maxI;n++){
+  const x=Number(zr)*inv,y=Number(zi)*inv;a[2*n]=x;a[2*n+1]=y;
+  if(x*x+y*y>1e8){n++;break}
+  const t=((zr*zr-zi*zi)>>pc)+cr;zi=((zr*zi)>>(pc-1n))+ci;zr=t;
+ }
+ return{a,len:Math.min(n,maxI+1)};
+}
+let dev,ctx,pipe,ub,rb,bg,busy=false,dirty=true,fullPending=false,idleT=0,fps=0,rt=0,lastF=0,iters=0,saveReq=false;
+const uab=new ArrayBuffer(32),uf=new Float32Array(uab),uu=new Uint32Array(uab);
+async function init(){
+ if(!navigator.gpu)throw 'WebGPU非対応です(Chrome / Edge 最新版で開いてください)';
+ const ad=await navigator.gpu.requestAdapter();if(!ad)throw 'WebGPUアダプタが見つかりません';
+ dev=await ad.requestDevice();ctx=cv.getContext('webgpu');
+ const fmt=navigator.gpu.getPreferredCanvasFormat();ctx.configure({device:dev,format:fmt,alphaMode:'opaque'});
+ const mod=dev.createShaderModule({code:WGSL});
+ pipe=dev.createRenderPipeline({layout:'auto',vertex:{module:mod,entryPoint:'vs'},fragment:{module:mod,entryPoint:'fs',targets:[{format:fmt}]},primitive:{topology:'triangle-list'}});
+ ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+ rb=dev.createBuffer({size:8*(MAXI+1),usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+ bg=dev.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:ub}},{binding:1,resource:{buffer:rb}}]});
+}
+async function draw(full){
+ const H=full?1080:540,W=Math.round(H*innerWidth/innerHeight);
+ if(cv.width!=W||cv.height!=H){cv.width=W;cv.height=H}
+ const t0=performance.now();iters=Math.min(MAXI,Math.floor(400+36*zl));
+ const{a,len}=orbit(iters);dev.queue.writeBuffer(rb,0,a,0,2*len);
+ const{m,e0}=view();uf[0]=W;uf[1]=H;uf[2]=m;uf[3]=e0;uu[4]=iters;uu[5]=len;uu[6]=pal;
+ dev.queue.writeBuffer(ub,0,uab);
+ const enc=dev.createCommandEncoder(),pass=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),loadOp:'clear',storeOp:'store',clearValue:{r:0,g:0,b:0,a:1}}]});
+ pass.setPipeline(pipe);pass.setBindGroup(0,bg);pass.draw(3);pass.end();dev.queue.submit([enc.finish()]);
+ if(saveReq&&full){saveReq=false;cv.toBlob(b=>{const l=document.createElement('a');l.href=URL.createObjectURL(b);l.download=`mandelbrot_${Date.now()}.png`;l.click()})}
+ await dev.queue.onSubmittedWorkDone();rt=performance.now()-t0;
+}
+function showHud(){
+ const z=2**zl;
+ hud.textContent=`Zoom: ${z.toExponential(2).replace('+','')}\nX: ${dec(cx)}\nY: ${dec(cy)}\nIterations: ${iters}\nFPS: ${fps.toFixed(0)}\nRender Time: ${rt.toFixed(1)} ms`;
+}
+const mark=()=>{dirty=true;idleT=performance.now()};
+async function loop(){
+ requestAnimationFrame(loop);if(busy)return;const now=performance.now();
+ if(dirty){busy=true;dirty=false;await draw(false);const dt=now-lastF;lastF=now;if(dt<500)fps=fps?fps*.7+300/dt:1000/dt;fullPending=true;busy=false;showHud()}
+ else if(fullPending&&now-idleT>250){busy=true;fullPending=false;await draw(true);busy=false;showHud()}
+}
+function zoomAt(px,py,dz){
+ const nz=Math.min(ZMAX,Math.max(0,zl+dz));dz=nz-zl;if(!dz)return;
+ const f=2**-dz,{m,e0}=view(),X=(px-innerWidth/2)/innerHeight,Y=-(py-innerHeight/2)/innerHeight;
+ cx+=fromS(X*(1-f)*m,e0);cy+=fromS(Y*(1-f)*m,e0);zl=nz;mark();
+}
+let drag=null;
+cv.addEventListener('pointerdown',e=>{if(e.button==0){drag=[e.clientX,e.clientY];cv.setPointerCapture(e.pointerId)}});
+cv.addEventListener('pointermove',e=>{if(!drag)return;const{m,e0}=view();
+ cx-=fromS((e.clientX-drag[0])/innerHeight*m,e0);cy+=fromS((e.clientY-drag[1])/innerHeight*m,e0);drag=[e.clientX,e.clientY];mark()});
+cv.addEventListener('pointerup',()=>drag=null);
+cv.addEventListener('wheel',e=>{e.preventDefault();zoomAt(e.clientX,e.clientY,-e.deltaY*.002)},{passive:false});
+cv.addEventListener('dblclick',e=>zoomAt(e.clientX,e.clientY,1.5));
+cv.addEventListener('contextmenu',e=>{e.preventDefault();zoomAt(e.clientX,e.clientY,-1.5)});
+addEventListener('resize',mark);
+addEventListener('keydown',e=>{if('123'.includes(e.key)){pal=+e.key-1;$('pal').selectedIndex=pal;mark()}});
+$('pal').onchange=e=>{pal=e.target.selectedIndex;mark()};
+$('bm').onchange=e=>{const b=BM[+e.target.value];if(b.length>1){cx=parse(b[1]);cy=parse(b[2]);zl=b[3]*L2_10;mark()}e.target.selectedIndex=0};
+$('save').onclick=()=>{saveReq=true;dirty=false;fullPending=false;busy=true;draw(true).then(()=>busy=false)};
+init().then(()=>requestAnimationFrame(loop)).catch(m=>{const e=$('err');e.style.display='flex';e.textContent=m});
+</script></body></html>
